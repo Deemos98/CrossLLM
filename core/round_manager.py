@@ -64,7 +64,9 @@ from .evidence_index import EvidenceIndexService
 from .pin_store import PinStore, PinState
 from .state import RoundState, SessionState
 from .storage import Storage
-from .context_budget import _token  # S3.5：TypeSafe helper
+# S3.3 预算：compute_budget 是纯函数（只依赖 能力 + 请求上限 + 固定输入），
+# 与"有没有历史可选"无关 —— R1 也用它建立请求预算（不绕 ContextSelector）。
+from .context_budget import ContextBudget, _token, compute_budget  # S3.5 helper / S3.3 预算
 from .model_capability import (
     CapabilityResolver,          # §一：能力来源协议（注入缝）
     FetchStatus,
@@ -378,6 +380,14 @@ class RoundManager:
             target.injected_rounds = list(round_state.injected_rounds)
             target.usage = {k: dict(v) for k, v in round_state.usage.items()}
             target.timestamp = _now()
+            # ── 本轮真实的请求预算结果必须持久化 ──────────────────────────
+            # reload 拿到的是 execute_round 开始时的快照（那时还没有预算）；
+            # 这里把内存中真实解析 / 计算出的值写回。少了这一步，state.json 会
+            # 显示 context_limit=null / reserved_output_tokens=null，
+            # **与真实发送给 Provider 的请求参数不一致**（会把审计带偏）。
+            target.context_limit = round_state.context_limit
+            target.reserved_output_tokens = round_state.reserved_output_tokens
+            target.request_max_output = round_state.request_max_output
         session.updated_at = _now()
         self.storage.save_state(session)
 
@@ -552,19 +562,6 @@ class RoundManager:
         metadata = await self._resolve_round_capability(round_state)
         round_state.context_limit = metadata.context_limit.value
 
-        # Round 1：严格独立（architecture P2）
-        if round_state.round_id == 1:
-            prompt = build_round1_prompt(
-                original_question=session.original_question,
-                participants=participants,
-            )
-            return {m: prompt for m in round_state.participants}, {}
-
-        # Round 2+：构造 Valid Round Pool（§11.3 step 1）+ Pin State
-        valid_pool = ValidRoundPoolBuilder(self.storage).build(session)
-        pin_store = PinStore(self.storage)
-        pin_state = pin_store.load(session.session_id)
-
         # ── 本次请求输出上限（§四）：只有显式给出才算已知 ──
         # 未显式给出 = unknown，**不再**用任何静态值兜底；此时 reserved 取模型
         # 能力上限（§22：reserved 不能超过模型允许的最大输出能力）。
@@ -576,8 +573,57 @@ class RoundManager:
         else:
             req_max = TokenEstimate(None, "provider_unavailable", "unknown")
 
-        # §21 fixed：粗估 system + 当前 user instruction（无 tool defs / 无 peer）
         from .context_budget import make_fixed_input_tokens
+
+        # Round 1：严格独立（architecture P2）
+        if round_state.round_id == 1:
+            prompt = build_round1_prompt(
+                original_question=session.original_question,
+                participants=participants,
+            )
+            # ── R1 也必须先建立请求预算 ────────────────────────────────────
+            # R1 没有历史，但它同样是**真实建立 LLM Prompt 的请求**，因此
+            # context_limit / model_max_output / request_max_output /
+            # reserved_output_tokens / fixed_input_tokens / history_budget / k
+            # 一个都不能缺（否则"这一轮到底被允许输出多少"无法审计，Provider
+            # 侧也只能自己兜 —— 实测曾兜出 max_tokens=1048351）。
+            #
+            # 预算的输入只有「模型能力 + 本次请求上限 + 固定输入」三项，
+            # 与"有没有历史可选"无关；所以这里直接调用 compute_budget() 纯函数，
+            # **不**绕 ContextSelector —— ContextSelector 只负责历史选择，
+            # 不再是 R1 是否拥有请求预算的前置条件。
+            #
+            # R1 的 prompt = SYSTEM_INSTRUCTION + 原始问题（build_round1_prompt），
+            # 因此 current_user 分量取 original_question：R1 **不注入**
+            # round_state.user_instruction，用它会把并不存在的输入算进 fixed。
+            r1_fixed = make_fixed_input_tokens(
+                system_text=SYSTEM_INSTRUCTION,
+                tool_text="",  # Phase 3 RealProvider 注入，本估算未含
+                current_user_text=session.original_question,
+                peer_context_reserve_text="",
+            )
+            r1_budget = compute_budget(
+                metadata=metadata,
+                request_max_output=req_max,
+                fixed=r1_fixed,
+                k=round_state.k,
+            )
+            # 与 R2+ 完全同源：reserved 写入 RoundState → _run_one 传给 Provider。
+            # model_max_output 取不到时 reserved 为 None（unknown / degraded，
+            # **不伪造**固定值），Provider 侧据此不下发 max_tokens。
+            round_state.reserved_output_tokens = (
+                r1_budget.reserved_output_tokens.value
+            )
+            # R1 必须落 context_budget 事件：它是真正建立请求的那一轮。
+            self._log_context_budget(session.session_id, round_state, r1_budget)
+            return {m: prompt for m in round_state.participants}, {}
+
+        # Round 2+：构造 Valid Round Pool（§11.3 step 1）+ Pin State
+        valid_pool = ValidRoundPoolBuilder(self.storage).build(session)
+        pin_store = PinStore(self.storage)
+        pin_state = pin_store.load(session.session_id)
+
+        # §21 fixed：粗估 system + 当前 user instruction（无 tool defs / 无 peer）
         fixed = make_fixed_input_tokens(
             system_text=SYSTEM_INSTRUCTION,
             tool_text="",  # Phase 3 RealProvider 注入，本估算未含
@@ -933,6 +979,37 @@ class RoundManager:
         policy_path.parent.mkdir(parents=True, exist_ok=True)
         with policy_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+    def _log_context_budget(
+        self, session_id: str, round_state: RoundState, budget: ContextBudget,
+    ) -> None:
+        """§八 / R1：把本轮的 ContextBudget 落 context_policy.jsonl。
+
+        R2+ 由 ContextSelector 在选历史时落同一事件；R1 没有历史选择环节，
+        但它是真实建立 LLM Prompt 的请求，**必须**同样留下 context_budget ——
+        否则"这一轮的输出预算是多少、reserved 从哪来"无法回放。
+
+        字段集合与 ContextSelector._log_selection 的 context_budget 事件**完全一致**
+        （都来自 ContextBudget.to_log()，平铺数字 / null），不新增第二套字段口径。
+        """
+        try:
+            policy_path = (
+                self.storage.session_dir(session_id) / "context_policy.jsonl"
+            )
+            policy_path.parent.mkdir(parents=True, exist_ok=True)
+            with policy_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "event": "context_budget",
+                    "session_id": session_id,
+                    "round_id": round_state.round_id,
+                    "timestamp": _iso_now(),
+                    **budget.to_log(),
+                }, ensure_ascii=False) + "\n")
+        except Exception as exc:  # noqa: BLE001 - 日志失败不影响 Round
+            _log(
+                f"session={session_id} round={round_state.round_id} "
+                f"context_budget_log_failed type={type(exc).__name__}: {exc}"
+            )
 
     def _build_evidence_for_round(
         self, session_id: str, round_state: RoundState,

@@ -899,8 +899,9 @@ def test_max_tokens_is_sent_to_provider():
 def test_max_tokens_respects_remaining_context():
     """核心约束：input + output <= context_limit。
 
-    当 messages 占用较多时，output 应被"剩余空间"限制，
-    而不是无脑用一个固定的输出上限。
+    当 messages 占用较多时，预算层给的输出上限必须与"剩余空间"求交，
+    而不是无脑采用；预算层给不出上限时则**不下发** max_tokens
+    （不把 context_limit 的剩余空间当成输出上限）。
     """
     seen = {}
 
@@ -915,17 +916,29 @@ def test_max_tokens_respects_remaining_context():
     # 构造一个约 300 token 的 prompt（900 chars / 3）
     long_prompt = "x" * 900
 
-    async def _collect():
-        return "".join([c async for c in provider.generate(round_id=1, prompt=long_prompt)])
+    async def _collect(max_output_tokens):
+        return "".join([
+            c async for c in provider.generate(
+                round_id=1, prompt=long_prompt,
+                max_output_tokens=max_output_tokens,
+            )
+        ])
 
-    asyncio.run(_collect())
+    # ① 预算层给了远超剩余空间的上限 → 求交后 = 剩余空间
+    #    input ≈ 300，剩余空间 = 1000 - 300 = 700
+    asyncio.run(_collect(100000))
+    assert seen["max_tokens"] == 700, (
+        f"output 应被剩余空间限制为 700，实际: {seen['max_tokens']}"
+    )
+    assert 300 + seen["max_tokens"] <= 1000
 
-    # input ≈ 300，剩余空间 = 1000 - 300 = 700
-    # 预算层未给输出上限 → 只下发 §24 的算术上界 700（不虚构固定值）
-    max_tokens = seen["max_tokens"]
-    assert max_tokens == 700, f"output 应被剩余空间限制为 700，实际: {max_tokens}"
-    # 硬约束验证：input + output <= context_limit
-    assert 300 + max_tokens <= 1000
+    # ② 预算层没给上限 → 不下发 max_tokens（不虚构，也不拿剩余空间兜）
+    seen.clear()
+    asyncio.run(_collect(None))
+    assert "max_tokens" not in seen, (
+        f"reserved 未知时不得下发 max_tokens，实际: {seen.get('max_tokens')}"
+    )
+
 
 
 def test_real_usage_is_captured():

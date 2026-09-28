@@ -245,9 +245,10 @@ class RealProvider:
         - context_limit 已知 → remaining = context_limit − actual_input；
           若 remaining <= 0，说明输入已占满窗口，**明确报错**（不猜一个值）。
         - reserved 已知      → actual = min(reserved, remaining)（或 reserved 本身）
-        - reserved 未知      → **不虚构**：若 context_limit 已知，只下发 remaining
-          （这是 §24 的算术上界，不是经验系数）；两者都未知 → 返回 None，
-          表示本次请求**不下发** max_tokens（由 Provider 自身默认语义决定）。
+        - reserved 未知      → **不虚构**：本次请求**不下发** max_tokens，返回 None
+          （由 Provider 自身默认语义决定）。刻意**不**回退成 remaining ——
+          那等于把"整个剩余窗口"当成输出上限，是把 context_limit 与 output
+          limit 混用（实测曾发出 max_tokens=1048351，§五 / §六 明令禁止）。
 
         禁止恢复固定 16000 / 80% ratio / context_limit × 0.9 / 任何经验系数。
         Provider **不得**重新计算另一套预算（S3.11 验收项 5）。
@@ -267,16 +268,16 @@ class RealProvider:
                 )
 
         if reserved_output_tokens is not None and reserved_output_tokens > 0:
+            # ① 预算层给了有效上限 → 优先采用它，再与剩余空间求交（§24）
             actual_output: int | None = (
                 reserved_output_tokens
                 if remaining is None
                 else min(reserved_output_tokens, remaining)
             )
             source = "budget_reserved"
-        elif remaining is not None:
-            actual_output = remaining
-            source = "context_limit_remaining"
         else:
+            # ② 预算层给不出（unknown / degraded）→ 不下发 max_tokens。
+            #    返回 None 让 Provider 用自身默认语义，保持"unknown 不虚构"。
             actual_output = None
             source = "unknown_no_cap"
 

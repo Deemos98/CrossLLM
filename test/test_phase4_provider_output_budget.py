@@ -2,28 +2,32 @@
 
 链路：
 
-    ContextBudget.reserved_output_tokens
+    ContextBudget.reserved_output_tokens（预算层；R1 与 R2+ 都要建）
         ↓ RoundManager（写入 RoundState.reserved_output_tokens）
         ↓ _run_one → provider.generate(max_output_tokens=…)
         ↓ real_provider._dynamic_max_tokens(messages, tools, reserved)
-        ↓ body["max_tokens"] = min(reserved, context_limit - actual_input)
+        ↓ reserved 已知 → body["max_tokens"] = min(reserved, context_limit - actual_input)
+          reserved 未知 → **不下发** max_tokens（不虚构上限）
 
 四个上限严格区分：
 
-    model_max_output —— 模型固有能力（models.yaml）
-    request_max_output  —— 本次请求显式配置
-    reserved_output_tokens     —— min(provider, request)，预算层预留（ContextBudget）
-    actual_output_limit        —— min(reserved, remaining)，真正发给 Provider
+    model_max_output       —— 模型自身能力（**只**来自 Provider 元数据）
+    request_max_output     —— 本次请求显式上限
+    reserved_output_tokens —— min(model_max_output, request_max_output)，预算层预留
+    actual_output_limit    —— min(reserved, remaining)，真正发给 Provider
 
 验收项：
- 1. provider > request → reserved = min(provider, request)
- 2. provider < request → reserved = min(provider, request)
- 3. provider unknown  → 按既定降级策略（reserved = request）
- 4. request unknown   → 按既定降级策略（reserved = provider）
+ 1. model_max > request → reserved = min(model_max, request)
+ 2. model_max < request → reserved = min(model_max, request)
+ 3. model_max unknown  → 按既定降级策略（reserved = request）
+ 4. request unknown    → 按既定降级策略（reserved = model_max）
  5. Provider 实际使用 reserved，不重算另一套预算
  6. Input + actual output limit <= context_limit
  7. MockProvider / Protocol 向后兼容
- 8. 日志可对账（provider_max / request_max / reserved）
+ 8. 日志可对账（model_max_output / request_max_output / reserved）
+ 9. R1 也建立请求预算（reserved 写回 + context_budget 事件），且**不**把
+    context_limit 的剩余空间当作百万级 max_tokens
+10. state.json 保留本轮真实的 context_limit / reserved_output_tokens
 
 禁止：固定 16000 / 80% ratio / HISTORY_WINDOW / should_compact 不得恢复。
 """
@@ -156,15 +160,15 @@ def _make_provider(context_limit=8192, max_output_tokens=2048,
 def test_5_provider_uses_reserved_not_own_calc():
     """Provider 必须采用传入的 reserved，而不是自己发明另一套上限。
 
-    构造：cfg.max_output_tokens 已删除（模型能力只来自 Provider 元数据），
-    reserved=1000 时输出 1000；未传 reserved 时**不虚构**固定值，
-    只下发 §24 的剩余空间。
+    cfg.max_output_tokens 已删除（模型能力只来自 Provider 元数据）：
+    reserved=1000 → 输出 1000；reserved 缺失 → **不下发** max_tokens，
+    既不虚构固定值，也**不**把 context_limit 的剩余空间当成输出上限。
     """
     p = _make_provider(context_limit=8192, max_output_tokens=2048)
     msgs = [{"role": "user", "content": "x" * 90}]  # 输入很小，remaining 充足
 
-    # 未指定 reserved → 只给 §24 的算术上界（不猜一个固定上限）
-    assert p._dynamic_max_tokens(msgs, None, None) == 8192 - 30
+    # 未指定 reserved → 不下发（剩余空间不是"输出上限"的合法来源）
+    assert p._dynamic_max_tokens(msgs, None, None) is None
     # 指定 reserved → 采用预算层的值
     assert p._dynamic_max_tokens(msgs, None, 1000) == 1000
 
@@ -202,11 +206,16 @@ def test_input_exceeds_limit_raises():
 
 
 def test_invalid_reserved_falls_back_safely():
-    """reserved <= 0 视为"预算层给不出" → 只下发剩余空间（不产生非法 max_tokens）。"""
+    """reserved <= 0 视为"预算层给不出" → 不下发 max_tokens（不产生非法值）。
+
+    **不**回退成"剩余空间"：那等于把 context_limit 当输出上限（§五 / §六）。
+    """
     p = _make_provider(context_limit=8192, max_output_tokens=2048)
     msgs = [{"role": "user", "content": "x" * 90}]
-    assert p._dynamic_max_tokens(msgs, None, 0) == 8192 - 30
-    assert p._dynamic_max_tokens(msgs, None, -1) == 8192 - 30
+    assert p._dynamic_max_tokens(msgs, None, 0) is None
+    assert p._dynamic_max_tokens(msgs, None, -1) is None
+    # 有效 reserved 不受影响
+    assert p._dynamic_max_tokens(msgs, None, 2048) == 2048
 
 
 # ── 7. MockProvider / Protocol 向后兼容 ─────────────────────────────────
@@ -264,8 +273,8 @@ def test_9_provider_uses_resolved_context_limit_over_yaml():
     msgs = [{"role": "user", "content": "x" * 90}]  # ≈30 tokens
 
     assert p._effective_context_limit() == 100000
-    # 未给 reserved → 下发 Provider 值的剩余空间（而不是 YAML 的 8192-30）
-    assert p._dynamic_max_tokens(msgs, None, None) == 100000 - 30
+    # 未给 reserved → 不下发 max_tokens（**不**把剩余空间当输出上限）
+    assert p._dynamic_max_tokens(msgs, None, None) is None
     # reserved 可以超过 YAML 值 —— 证明 YAML 不再是上限
     assert p._dynamic_max_tokens(msgs, None, 50000) == 50000
     # §24：input + output ≤ Provider 给出的 context_limit
@@ -279,7 +288,10 @@ def test_9b_yaml_context_limit_is_fallback_only():
     msgs = [{"role": "user", "content": "x" * 90}]
 
     assert p._effective_context_limit() == 8192
-    assert p._dynamic_max_tokens(msgs, None, None) == 8192 - 30
+    # fallback 值参与 §24 求交：reserved=100000 被 8192-30 截断（证明用的是 YAML 值）
+    assert p._dynamic_max_tokens(msgs, None, 100000) == 8192 - 30
+    # 无 reserved → 不下发（不拿剩余空间兜）
+    assert p._dynamic_max_tokens(msgs, None, None) is None
 
 
 def test_9c_both_unknown_sends_no_max_tokens():
@@ -358,10 +370,11 @@ def test_9d_round_manager_injects_resolved_limit_into_provider(tmp_path):
         for l in (storage.session_dir(sid) / "context_policy.jsonl")
         .read_text(encoding="utf-8").splitlines() if l.strip()
     ]
+    # ③ 与 context_budget 日志同源：R1 也必须落 context_budget（它真实建了 prompt）
     cb = [e for e in events if e["event"] == "context_budget"
           and e["round_id"] == 1]
-    if cb:  # R1 无 ContextSelector → 可能没有预算事件；有则必须同源
-        assert cb[0]["context_limit"] == PROVIDER_CTX
+    assert cb, "R1 必须落 context_budget 事件（它是真实建立 LLM Prompt 的请求）"
+    assert cb[0]["context_limit"] == PROVIDER_CTX
     # 刻意**不**清理 tmp_path：测试产物默认保留，便于人工复查 / 反向证明。
 
 
@@ -586,3 +599,217 @@ def test_ui_round_policy_only_carries_k():
     )
     assert "reqMaxOutput" not in ret
     assert "k:" in ret, "k 仍必须由 UI 提供（§六：k 只影响 lossless/compaction）"
+
+
+# ── R1 也必须建立请求预算（A / B / D / E / F / G）────────────────────────
+#
+# 已确认的问题：_build_prompts_async() 原先在 R1 分支**过早 return** ——
+# R1 在 ContextSelector（唯一建预算的地方）之前就返回了，于是
+#   round_state.reserved_output_tokens 恒为 None
+#   → provider.generate(max_output_tokens=None)
+#   → RealProvider 只拿得到"剩余空间"，把它当输出上限
+#   → 实测一次真实请求发出 max_tokens = 1048351（≈ 整个窗口）。
+#
+# R1 确实没有历史，但它同样是**真实建立 LLM Prompt 的请求**，因此必须与
+# R2+ 一样先建立预算；而预算的输入（模型能力 + 请求上限 + 固定输入）本来就
+# 与"有没有历史可选"无关。
+
+R1_PROVIDER_CTX = 1_048_576   # 真实量级：Provider 元数据给出的窗口
+R1_YAML_CTX = 16384           # models.yaml fallback（不应被 R1 用到）
+R1_MODEL_MAX_OUT = 8192       # 模型自身能力上限（远小于窗口）
+
+
+def _drive_rounds(
+    tmp_path, *, model_max_output=R1_MODEL_MAX_OUT, req_max=None, rounds=1,
+):
+    """驱动 rounds 个 Round，返回 (storage, sid, [RoundState], captured)。
+
+    captured[round_id] = Provider 实际收到的 max_output_tokens。
+    """
+    os.environ.setdefault("CROSSLLM_MOCK_DELAY_SCALE", "0")
+    from core.model_manager import ModelRegistry, ProviderConfig
+    from core.round_manager import RoundManager
+    from core.session_manager import SessionManager
+    from core.storage import Storage
+
+    captured: dict[int, int | None] = {}
+
+    class _Spy:
+        def __init__(self, mid):
+            self.mid = mid
+
+        async def generate(self, round_id, prompt, tools=None,
+                           max_output_tokens=None):
+            captured[round_id] = max_output_tokens
+            yield f"[{self.mid}] " + ("内容。" * 20)
+
+    storage = Storage(tmp_path / "sessions")
+    registry = ModelRegistry(configs={
+        mid: ProviderConfig(
+            model_id=mid, display_name=mid.upper(),
+            model=f"fake/{mid}", context_limit=R1_YAML_CTX,
+        )
+        for mid in ("qwen", "deepseek")
+    })
+    rm = RoundManager(
+        storage, registry, _Spy,
+        capability_resolver=StubCapabilityResolver(
+            context_limit=R1_PROVIDER_CTX,
+            model_max_output=model_max_output,
+        ),
+    )
+    sm = SessionManager(storage, registry)
+    sess = sm.create("Q?")
+    sid = sess.session_id
+
+    async def _drive(instr: str):
+        rs, bus = rm.prepare_round(
+            sess, instr, peer_review=False, k=0.5,
+            request_max_output=req_max,
+        )
+        await rm.execute_round(sid, rs, bus)
+        return rs
+
+    rss = [asyncio.run(_drive(f"R{i}")) for i in range(1, rounds + 1)]
+    return storage, sid, rss, captured
+
+
+def _round_events(storage, sid, round_id=None):
+    ev = [
+        json.loads(l)
+        for l in (storage.session_dir(sid) / "context_policy.jsonl")
+        .read_text(encoding="utf-8").splitlines() if l.strip()
+    ]
+    if round_id is None:
+        return ev
+    return [e for e in ev if e.get("round_id") == round_id]
+
+
+def test_r1_establishes_request_budget(tmp_path):
+    """A / B / D / E：R1 必须建立完整请求预算，并落 context_budget 事件。
+
+    request_max_output 未给出时，reserved = 已知的 model_max_output（§22 分支①）。
+    """
+    storage, sid, rss, _ = _drive_rounds(tmp_path, rounds=1)
+    rs1 = rss[0]
+
+    # A：R1 有 reserved（不再是 None）
+    assert rs1.reserved_output_tokens is not None, (
+        "R1 必须建立 reserved_output_tokens（它真实建立了 LLM Prompt）"
+    )
+    # B：request 未显式给出 → reserved = model_max_output
+    assert rs1.reserved_output_tokens == R1_MODEL_MAX_OUT
+    # context_limit 仍是 Provider 元数据值（不是 YAML）
+    assert rs1.context_limit == R1_PROVIDER_CTX
+
+    # E：R1 必须落 context_budget 事件
+    cb = [e for e in _round_events(storage, sid, 1)
+          if e["event"] == "context_budget"]
+    assert cb, "R1 必须落 context_budget 事件（它是真正建立请求的那一轮）"
+    e = cb[0]
+
+    # D：R1 的字段一个都不能缺
+    for field in ("context_limit", "model_max_output", "request_max_output",
+                  "reserved_output_tokens", "fixed_input_tokens",
+                  "history_budget", "k"):
+        assert field in e, f"R1 的 context_budget 缺字段 {field}"
+
+    assert e["context_limit"] == R1_PROVIDER_CTX
+    assert e["model_max_output"] == R1_MODEL_MAX_OUT
+    assert e["request_max_output"] is None      # 未显式指定 = unknown，不造固定值
+    assert e["reserved_output_tokens"] == R1_MODEL_MAX_OUT
+    assert e["k"] == 0.5
+    assert e["budget_status"] == "complete"
+    # §21：history_budget = context_limit − fixed − reserved
+    assert e["history_budget"] == (
+        e["context_limit"] - e["fixed_input_tokens"] - e["reserved_output_tokens"]
+    )
+
+
+def test_r1_never_sends_context_remaining_as_max_tokens(tmp_path):
+    """F：R1 下发给 Provider 的 max_tokens 必须是 reserved，不是剩余空间。
+
+    这是本问题的直接回归守卫：修复前 R1 会发出 ≈ 整个窗口的 max_tokens。
+    """
+    _, _, _, captured = _drive_rounds(tmp_path, rounds=1)
+
+    assert captured.get(1) == R1_MODEL_MAX_OUT, (
+        f"R1 的 max_tokens 必须来自预算层 reserved，实际={captured.get(1)}"
+    )
+    # 明确排除"把 context_limit 剩余空间当输出上限"的形态（应远小于窗口量级）
+    assert captured[1] < R1_PROVIDER_CTX // 100, (
+        f"R1 不得把 context_limit 剩余空间当输出上限，实际={captured[1]}"
+    )
+
+
+def test_r1_request_max_bounds_reserved(tmp_path):
+    """B：request_max_output 有值时 → reserved = min(model_max, request)。"""
+    _, _, rss, captured = _drive_rounds(tmp_path, req_max=1000, rounds=1)
+    assert rss[0].reserved_output_tokens == 1000
+    assert captured.get(1) == 1000
+
+
+def test_r1_unknown_model_max_is_degraded_not_fabricated(tmp_path):
+    """B / §五：model_max_output 取不到 → degraded + 不下发，**不伪造**数值。"""
+    storage, sid, rss, captured = _drive_rounds(
+        tmp_path, model_max_output=None, rounds=1,
+    )
+
+    assert rss[0].reserved_output_tokens is None
+
+    cb = [e for e in _round_events(storage, sid, 1)
+          if e["event"] == "context_budget"]
+    assert cb, "R1 仍必须落 context_budget 事件（哪怕是 degraded）"
+    assert cb[0]["reserved_output_tokens"] is None
+    assert cb[0]["budget_status"] == "degraded"
+    assert cb[0]["history_budget"] is None, "未知时不得虚构 history_budget"
+
+    # F：没有合法上限 → 不下发 max_tokens（而不是拿剩余空间兜底）
+    assert captured.get(1) is None
+
+
+def test_state_json_keeps_round_budget(tmp_path):
+    """G：state.json 必须保留本轮真实的 context_limit / reserved_output_tokens。
+
+    修复前 execute_round() 从磁盘 reload 后只回写 status/injected_rounds/
+    usage/timestamp，这两项会显示为 null —— 与真实发送的请求参数不一致。
+    """
+    storage, sid, rss, _ = _drive_rounds(tmp_path, req_max=1000, rounds=1)
+
+    state = json.loads(
+        (storage.session_dir(sid) / "state.json").read_text(encoding="utf-8")
+    )
+    r1 = next(r for r in state["rounds"] if r["round_id"] == 1)
+
+    assert r1["context_limit"] == R1_PROVIDER_CTX
+    assert r1["reserved_output_tokens"] == 1000
+    assert r1["request_max_output"] == 1000          # 既有字段不受影响
+    # 与内存中的 RoundState 完全一致（不是另一套值）
+    assert r1["context_limit"] == rss[0].context_limit
+    assert r1["reserved_output_tokens"] == rss[0].reserved_output_tokens
+
+
+def test_r2_budget_not_regressed(tmp_path):
+    """R2+ 原有行为不回归：仍有 context_budget、reserved 同源、并写入 state.json。"""
+    storage, sid, rss, captured = _drive_rounds(tmp_path, req_max=1000, rounds=2)
+
+    # 两轮都建立了预算，且值一致（同一次注入的模型能力）
+    assert [r.reserved_output_tokens for r in rss] == [1000, 1000]
+    assert captured.get(1) == 1000 and captured.get(2) == 1000
+
+    # R2 仍走 ContextSelector 路径 → context_budget 与 history_selection 都在
+    kinds = {e["event"] for e in _round_events(storage, sid, 2)}
+    assert "context_budget" in kinds
+    assert "history_selection" in kinds, "R2+ 的历史选择事件不得消失"
+
+    cb2 = [e for e in _round_events(storage, sid, 2)
+           if e["event"] == "context_budget"][0]
+    assert cb2["reserved_output_tokens"] == 1000
+    assert cb2["budget_status"] == "complete"
+
+    state = json.loads(
+        (storage.session_dir(sid) / "state.json").read_text(encoding="utf-8")
+    )
+    r2 = next(r for r in state["rounds"] if r["round_id"] == 2)
+    assert r2["reserved_output_tokens"] == 1000
+    assert r2["context_limit"] == R1_PROVIDER_CTX

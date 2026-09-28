@@ -1,0 +1,42 @@
+# CrossLLM
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 密钥（phase2_real_llm.md §6：API Key 不得提交进 Git）
+.env
+!.env.example
+
+# 本地实例配置：含 API Key / 端口 / 本地模型条目，且会随环境与实测漂移
+#   入库的是模板：config/models.example.yaml、config/mcp.example.yaml
+#   真实配置只留在本地工作区，不进入任何提交
+config/models.yaml
+config/mcp.yaml
+
+# 运行期数据根（phase1_mock.md §10）
+#   sessions/ = 会话原始归档（Raw Archive，不可变）
+#   projects/ = Project Memory（M1/M2 手动确认生成的记忆候选）
+sessions/
+projects/
+
+# 参考仓库只读，不纳入本项目版本管理
+reference/
+
+# 测试期临时产物
+.coverage
+htmlcov/
+.pytest_tmp/
+.phase4_e2e_sessions/
+.mcp_health_report.json
+
+# 运行日志（服务端 / MCP 健康检查 / E2E / pytest）
+*.log
+
+# 模型能力元数据磁盘缓存（core/model_capability.py 联网拉取后写入）
+.model_metadata_cache.json
+
+# 清理前审计与回滚快照（工作区 .audit/，不随项目发布）
+.audit/

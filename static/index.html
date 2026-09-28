@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CrossLLM</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       侧栏 —— 导航与设置
+       层级：会话历史（辅助导航） / 项目记忆（工具面板） / 本轮设置
+       本区块只有导航与配置职责，不承载任何对话内容。
+       ═══════════════════════════════════════════════════════════════════ -->
+  <aside class="sidebar" id="sidebar">
+
+    <div class="sb-brand">
+      <span class="sb-mark" aria-hidden="true">◧</span>
+      <span class="sb-brand-text">
+        <span class="sb-brand-name">CrossLLM</span>
+        <span class="sb-brand-sub">多模型交叉评审</span>
+      </span>
+    </div>
+
+    <div class="sb-actions">
+      <button id="btn-reset" class="btn btn-block" type="button"
+              title="新建会话：关闭当前连接、清空本地记录后重新开始">＋ 新建会话</button>
+    </div>
+
+    <div class="sb-scroll">
+
+      <!-- 会话历史：只读导航入口（点击切换到已保存的历史会话）。
+           只调用 GET /api/sessions + GET /api/session/{id}；
+           不做检索、不做上下文注入、不碰项目记忆。 -->
+      <section class="sb-block" id="session-history" hidden>
+        <div class="sb-block-head">
+          <span class="sb-block-title">会话历史</span>
+          <button id="session-history-refresh" class="btn btn-mini" type="button">刷新</button>
+        </div>
+        <div id="session-history-list" class="sb-list"></div>
+        <p class="sb-note">
+          点击任一条即切换会话（旧会话的连接会先关闭）。这里只做导航，不检索内容、不注入上下文。
+        </p>
+      </section>
+
+      <!-- 项目记忆：只由用户点击触发；正式记忆只在点「确认保存」后产生。
+           普通轮次 / 摘要 / 压缩 / 互评 / 工具调用都不会自动写入。 -->
+      <section class="sb-block" id="memory-panel" hidden>
+        <details class="sb-collapse" open>
+          <summary class="sb-collapse-head">
+            <span class="sb-block-title">项目记忆</span>
+            <span id="memory-stats" class="sb-block-meta"></span>
+            <span class="sb-chev" aria-hidden="true">›</span>
+          </summary>
+
+          <div class="sb-collapse-body">
+            <!-- 1. 用户显式触发：生成记忆候选 -->
+            <div class="memory-compose">
+              <button id="memory-compose-toggle" class="btn btn-mini" type="button">＋ 生成记忆候选</button>
+              <button id="memory-refresh" class="btn btn-mini" type="button">刷新</button>
+              <span class="memory-note">仅在你点击后生成；不会在普通回答后自动产生</span>
+            </div>
+
+            <div id="memory-compose-form" class="memory-form" hidden>
+              <label class="memory-row">
+                <span>候选内容（必填，可自由编辑后再提交）</span>
+                <textarea id="memory-content" rows="3"
+                  placeholder="例如：最终选择方案 Y，实测提升 18%。"></textarea>
+              </label>
+              <div class="memory-row memory-fields">
+                <label>
+                  <span>类型</span>
+                  <select id="memory-kind">
+                    <option value="fact">已确认事实</option>
+                    <option value="decision" selected>决策</option>
+                    <option value="experiment">实验结果</option>
+                    <option value="rejected">已排除方案</option>
+                    <option value="open_question">待解决问题</option>
+                    <option value="evidence_reference">证据引用</option>
+                  </select>
+                </label>
+                <label>
+                  <span>来源语义</span>
+                  <select id="memory-semantics">
+                    <option value="opinion">模型观点</option>
+                    <option value="decision" selected>用户决策</option>
+                    <option value="evidence">证据</option>
+                    <option value="result">实验结果</option>
+                  </select>
+                </label>
+                <label>
+                  <span>来源</span>
+                  <select id="memory-source">
+                    <option value="round">轮次回答</option>
+                    <option value="conversation_summary">对话摘要</option>
+                    <option value="mcp_evidence">MCP 证据</option>
+                    <option value="user_input" selected>用户输入</option>
+                  </select>
+                </label>
+                <label class="memory-refs">
+                  <span>引用来源（逗号分隔，可留空）</span>
+                  <input type="text" id="memory-refs" placeholder="例如：第 3 轮回答、证据 call_A">
+                </label>
+              </div>
+              <div class="memory-actions">
+                <button id="memory-candidate-submit" class="btn btn-mini btn-ok" type="button">创建候选</button>
+                <button id="memory-candidate-cancel" class="btn btn-mini" type="button">取消</button>
+              </div>
+            </div>
+
+            <!-- 2/3. 候选列表 + 确认保存 / 取消 -->
+            <div id="memory-candidates" class="memory-list"></div>
+
+            <!-- 5/6. 重复 / 冲突提示（原样展示后端结论，前端不重新判断） -->
+            <div id="memory-notice" class="memory-notice" hidden></div>
+
+            <!-- 4. 已确认记忆 -->
+            <div class="memory-sub-head">已确认记忆</div>
+            <div id="memory-list" class="memory-list"></div>
+
+            <p class="memory-note">项目记忆不会自动进入对话上下文；此处只做创建与确认。</p>
+          </div>
+        </details>
+      </section>
+
+      <!-- 本轮设置：参与模型 / 平级互评 / 无损历史保留比例 k
+           模型的启用与停用是会话级状态；本轮勾选只是本次发送的子集。 -->
+      <section class="sb-block" id="picker-bar" hidden>
+        <details class="sb-collapse" open>
+          <summary class="sb-collapse-head">
+            <span class="sb-block-title">本轮设置</span>
+            <span class="sb-chev" aria-hidden="true">›</span>
+          </summary>
+          <div class="sb-collapse-body">
+            <div class="picker-head">
+              <span class="field-hint">参与模型</span>
+            </div>
+            <div id="model-picker" class="picker"></div>
+
+            <label class="switch">
+              <input type="checkbox" id="peer-review" checked>
+              <span>平级互评 —— 注入其他模型的匿名回答（取消勾选则各模型只看到自己的历史）</span>
+            </label>
+
+            <!-- 全页唯一的 k 控件，随每次发送提交（sendRound() / readRoundPolicy()
+                 读取的就是它 → 请求体 k → 后端上下文预算 k）。 -->
+            <div class="k-row">
+              <label class="field-hint" for="k-slider">无损历史保留比例 k：<code id="k-value">0.50</code></label>
+              <input type="range" id="k-slider" min="0.01" max="0.90" step="0.01" value="0.5">
+              <span class="k-hint">k 越高，越多历史保留原文；压缩区越小。每次发送都会使用该值。</span>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <p class="sb-foot">CrossLLM 是机制验证载体：不做投票、不做裁判、不选优胜方。</p>
+    </div>
+  </aside>
+
+  <div class="sidebar-scrim" id="sidebar-scrim"></div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       主区 —— 顶栏（当前会话 + 状态） + 对话流
+       模型回答是页面主体；会话历史属于侧栏辅助导航。
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div class="workspace">
+
+    <header class="topbar">
+      <button id="sidebar-toggle" class="btn btn-icon topbar-menu" type="button"
+              title="折叠 / 展开侧栏" aria-label="折叠 / 展开侧栏">☰</button>
+      <div class="topbar-title">
+        <h1 id="session-title">未创建会话</h1>
+        <!-- 会话编号属于排查信息，收进可展开的开发者信息，不占视觉焦点 -->
+        <details class="dev-info">
+          <summary class="dev-info-head">开发者信息</summary>
+          <div class="dev-line">会话编号：<code id="session-id">（未创建）</code></div>
+        </details>
+      </div>
+
+      <!-- 辅助状态：compact badge，不占纵向版面 -->
+      <div class="topbar-badges">
+        <button id="evidence-toggle" class="btn btn-mini status-toggle" type="button"
+                aria-pressed="false" title="展开 / 收起 MCP 证据面板">证据</button>
+        <aside id="pin-banner" class="status-chip status-chip-pin" hidden>
+          <span class="status-chip-icon" aria-hidden="true">📌</span>
+          <span id="pin-banner-text">固定：</span>
+        </aside>
+        <aside id="summary-banner" class="status-chip status-chip-summary" hidden>
+          <span class="status-chip-icon" aria-hidden="true">📋</span>
+          <span id="summary-banner-text">摘要：</span>
+        </aside>
+      </div>
+    </header>
+
+    <main class="conversation" id="conversation">
+      <div id="rounds" class="rounds"></div>
+
+      <!-- 对话摘要结果独立渲染（语义上属于对话摘要，
+           不与普通回答混在 #rounds 里） -->
+      <section id="summary-results" class="summary-results"></section>
+
+      <!-- MCP 证据面板（只展示追溯索引，不判定事实）
+           辅助信息 → 折叠面板，不常驻纵向空间。 -->
+      <aside id="evidence-panel" class="evidence-panel" hidden>
+        <details class="collapse" open>
+          <summary class="collapse-head">
+            <span class="collapse-title">MCP 证据</span>
+            <span id="evidence-stats" class="collapse-meta"></span>
+            <button id="evidence-refresh" class="btn btn-mini" type="button">刷新</button>
+          </summary>
+          <div class="collapse-body">
+            <p id="evidence-empty" class="evidence-empty" hidden>本次会话还没有可追溯的工具调用证据。</p>
+            <table class="evidence-table">
+              <thead>
+                <tr>
+                  <th>轮次</th><th>来源</th><th>工具</th><th>证据引用</th><th>是否被回答引用</th>
+                </tr>
+              </thead>
+              <tbody id="evidence-tbody"></tbody>
+            </table>
+            <p class="evidence-note">
+              这里只是「工具返回被最终回答引用」的追溯索引，不代表事实已经验证。
+            </p>
+          </div>
+        </details>
+      </aside>
+    </main>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       底栏 —— 上下文 / 控件 / 输入区（跨全宽）
+       ═══════════════════════════════════════════════════════════════════ -->
+  <footer class="dock" id="dock">
+
+    <div class="dock-status">
+      <span id="mode-hint" class="mode-hint"></span>
+    </div>
+
+    <!-- 第一步：建立会话（已有会话后自动隐藏） -->
+    <section class="dock-setup" id="setup-bar">
+      <label class="field-label" for="question">原始问题</label>
+      <div class="field-row">
+        <textarea id="question" rows="2" placeholder="输入你的问题…"></textarea>
+        <button id="btn-create" class="btn btn-primary" type="button">新建会话</button>
+      </div>
+    </section>
+
+    <!-- 第三步：发送（第二步的「本轮设置」在左侧侧栏） -->
+    <section class="dock-send" id="send-bar" hidden>
+      <label class="field-label" for="instruction">本轮指令</label>
+      <div class="field-row">
+        <textarea id="instruction" rows="2"
+          placeholder="例如：请评价其他参与者的方案，并说明哪些内容值得吸收。"></textarea>
+        <button id="btn-send" class="btn btn-primary" type="button">发送</button>
+      </div>
+
+      <div class="dock-opts">
+        <!-- 输出上限不再由 UI 手工配置：模型能力上限来自 Provider 元数据，
+             本次请求的有效输出上限由后端预算层（ContextBudget）决定并落到
+             context_policy.jsonl 的 reserved_output_tokens。 -->
+        <!-- 用户主动生成对话摘要：勾选后输入框自动清空并填入默认摘要提示词
+             （提示词由后端提供，前端不硬编码）。此时点「发送」发出的是摘要请求：
+             不创建轮次，结果单独落盘与展示。 -->
+        <label class="switch switch-inline">
+          <input type="checkbox" id="summary-toggle">
+          <span>对话摘要 —— 勾选后输入框自动填入默认摘要提示词，可修改后发送（生成对话摘要，不创建轮次）</span>
+        </label>
+
+        <p id="summary-hint" class="summary-hint" hidden>
+          摘要模式已开启：本次「发送」会生成一份对话摘要，不占用轮次编号，
+          目标为侧栏中已勾选的模型。
+        </p>
+      </div>
+    </section>
+  </footer>
+
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

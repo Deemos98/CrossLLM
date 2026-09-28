@@ -1,0 +1,29 @@
+# Mock 配置模板 —— 不接真实模型、不消耗任何额度时使用
+#
+# 用法：复制为 config/models.yaml
+#
+# 与 OpenRouter 配置的结构完全一致，只是 provider.type 为 mock：
+#   - provider 块里不需要 base_url / api_key_env（mock 不发真实请求）
+#   - models 里的 model 字段用任意标识即可，不对应真实 slug
+#   - context_limit / max_output_tokens 可省略，会用保守的兜底值
+#   - tools 为空列表或不写表示该模型不使用 MCP
+
+provider:
+  name: mock
+  type: mock
+
+models:
+  - id: qwen
+    name: Qwen
+    model: mock-qwen
+    enabled: true
+
+  - id: deepseek
+    name: DeepSeek
+    model: mock-deepseek
+    enabled: true
+
+  - id: gpt
+    name: GPT
+    model: mock-gpt
+    enabled: true

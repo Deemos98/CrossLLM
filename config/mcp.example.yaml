@@ -1,0 +1,193 @@
+# CrossLLM MCP 配置模板（示例）
+#
+# 用法：复制为 config/mcp.yaml 后再按本机情况调整。
+#     copy config\mcp.example.yaml config\mcp.yaml
+#
+# 与 config/mcp.yaml 的唯一差别：本文件里的 command / 白名单路径全部写成
+# **可移植形式**（相对命令名、相对目录）。真实配置文件里请改成本机绝对路径，
+# 原因：CrossLLM 用 uvicorn 起子进程，子进程常常解析不到相对命令名，
+# 报 `WinError 2 系统找不到指定的文件`。
+#
+# 密钥一律不写进本文件，只写 ${VAR} 占位符；真实值放 .env（已被 .gitignore 排除）。
+# CrossLLM 启动时 load_dotenv() 把 .env 注入 os.environ，
+# MCPRegistry 启动子进程时用 os.environ.copy() 继承。
+#
+# 每个 server 的 tool_name 是**只读白名单**：Server 内部可能暴露十几个工具
+# （含写入类），这里只放行一个只读工具。找不到该工具时健康检查会降级。
+
+servers:
+  # Open-WebSearch：网页搜索（找）
+  openwebsearch:
+    enabled: true
+    # stdio: CrossLLM 自己拉起一个进程，所有模型共享（单例）
+    # sse:   连接已运行的 HTTP SSE 端点（需先手动启动 Server）
+    transport: stdio
+    command: "open-websearch"
+    args: []
+    env:
+      # stdio 直连，不需要 HTTP server，避免占用 3000 端口
+      MODE: stdio
+      DEFAULT_SEARCH_ENGINE: bing
+      # 如需代理，取消下面两行注释：
+      # USE_PROXY: "true"
+      # PROXY_URL: "http://127.0.0.1:7890"
+    tool_name: search
+
+  # GitHub MCP（社区版 @modelcontextprotocol/server-github）
+  #
+  # 说明：GitHub 官方 github-mcp-server 不发布 Windows 二进制（需 Docker 或 Go 编译），
+  # 故先用社区版 stdio 跑通。
+  # GITHUB_PERSONAL_ACCESS_TOKEN 不写在这里 —— 由 .env 注入 os.environ 后继承。
+  # 该 Server 共暴露 26 个工具（含 12 个写入类），因此只放行 search_issues 一个只读工具。
+  github:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_READ_ONLY: "1"
+    tool_name: search_issues
+
+  # Fetch MCP：URL → Markdown（读）
+  # 与 OpenWebSearch 的分工：OpenWebSearch = 找，Fetch = 读
+  fetch:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@mokei/mcp-fetch"]
+    env: {}
+    tool_name: get_markdown
+
+  # Filesystem MCP：本地文件访问
+  # args 的第一项是**允许访问的目录白名单**，请改成自己的目录。
+  # 该 Server 暴露多个工具，通过 tool_name 只放行 read_file。
+  filesystem:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "./docs"
+    env: {}
+    tool_name: read_file
+
+  # Context7 MCP：开源库文档查询
+  context7:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@upstash/context7-mcp"]
+    env:
+      # 需要 CONTEXT7_API_KEY（放 .env）；无 Key 时仍可连接，但更容易 rate limit
+      CONTEXT7_API_KEY: "${CONTEXT7_API_KEY}"
+    tool_name: query-docs
+
+  # Playwright MCP：动态网页渲染与抓取
+  # 首次运行需要下载浏览器
+  playwright:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@playwright/mcp"]
+    env: {}
+    tool_name: browser_snapshot
+
+  # Stack Overflow MCP：编程问答搜索
+  # 已替换掉不可用的 @gscalzo/stackoverflow-mcp
+  stackoverflow:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@luqezman/stackoverflow-mcp"]
+    env:
+      # 可选；未配置时仍可用但 rate limit 更严格
+      STACKOVERFLOW_API_KEY: "${STACKOVERFLOW_API_KEY}"
+    tool_name: search_questions
+
+  # 知乎 MCP：官方 SSE 远程服务（不需要本地进程）
+  zhihu:
+    enabled: true
+    transport: sse
+    url: "https://developer.zhihu.com/api/mcp/zhihu_search/v1/sse"
+    headers:
+      Authorization: "Bearer ${ZHIHU_ACCESS_SECRET}"
+    tool_name: zhihu_search
+
+  # 中文趋势聚合（mcp-trends-hub）：微博/知乎/掘金/B 站 等热榜，全部只读，无需 Key
+  trendshub:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "mcp-trends-hub"]
+    env: {}
+    tool_name: get_zhihu_trending
+
+  # OpenAlex 学术文献检索：完全开放的学术数据库，无需 Key
+  openalex:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "openalex-mcp-server"]
+    env: {}
+    tool_name: openalex_search
+
+  # Everything Search：Windows 下依赖 Everything 服务的文件名搜索，只读
+  # 跨平台有兜底（macOS Spotlight / Linux ripgrep-locate）
+  everything:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "everything-search-mcp"]
+    env: {}
+    tool_name: search_files
+
+  # PDF → Markdown：纯本地处理，不上传，无需 Key
+  pdf2md:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@pdf2md/mcp"]
+    env: {}
+    tool_name: convert_pdf
+
+  # Excel 读写：Server 暴露 7 个工具（含写入类），这里只放行一个只读工具
+  # 替代需要 pandas 的 `excel-mcp-server`（Python 依赖）
+  excel:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@negokaz/excel-mcp-server"]
+    env: {}
+    tool_name: excel_read_sheet
+
+  # YouTube 字幕：只读，无需 Key
+  yt_transcript:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@fabriqa.ai/youtube-transcript-mcp"]
+    env: {}
+    tool_name: get-transcript
+
+  # Hugging Face MCP：模型/数据集检索
+  # 无 HF_TOKEN 时工具仍可列出，但实际调用会受限
+  huggingface:
+    enabled: true
+    transport: stdio
+    command: "npx"
+    args: ["-y", "@llmindset/hf-mcp-server"]
+    env:
+      HF_TOKEN: "${HF_TOKEN}"
+    tool_name: hub_repo_search
+
+  # Reddit MCP：基于 redditwarp 调用 Reddit 公共 API，无需 OAuth 凭证
+  # 通过 scripts/wrappers/reddit_server.py 包装，以兼容本项目的 mcp 1.x。
+  # `python` 请按本机解释器改写（Windows 虚拟环境为 .venv\Scripts\python.exe）。
+  reddit:
+    enabled: true
+    transport: stdio
+    command: "python"
+    args: ["scripts/wrappers/reddit_server.py"]
+    env: {}
+    tool_name: get_frontpage_posts
